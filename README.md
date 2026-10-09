@@ -10,6 +10,7 @@
 
 ## 目录
 
+- [下载](#下载)
 - [快速开始](#快速开始)
 - [它能做什么](#它能做什么)
 - [架构与原理](#架构与原理)
@@ -25,13 +26,57 @@
 
 ---
 
-## 快速开始
+## 下载
 
-**唯一前提**：本机装有 Python 3.8 或更高版本。不需要 `pip install`，不需要 Node.js，不需要联网。
+**唯一前提**：本机装有 [Python 3.8+](https://www.python.org/downloads/)。不需要 `pip install`，不需要 Node.js，不需要联网。
+
+### 方式一：Git 克隆（推荐，便于 `git pull` 更新）
 
 ```bash
-# 1. 进入项目目录
-cd 哈希取证智能体
+git clone https://github.com/winter646258/hash-forensics-agent.git
+cd hash-forensics-agent
+```
+
+### 方式二：下载 ZIP（不需要 Git）
+
+```
+https://github.com/winter646258/hash-forensics-agent/archive/refs/heads/main.zip
+```
+
+下载后解压到任意目录即可，无需安装。
+
+### 方式三：只取单个文件
+
+只需要智能体本体时，直接下载这两个文件放到同一目录：
+
+- [`agent.py`](https://raw.githubusercontent.com/winter646258/hash-forensics-agent/main/agent.py)
+- [`toolkit.py`](https://raw.githubusercontent.com/winter646258/hash-forensics-agent/main/toolkit.py)
+
+> 命令行下载（Windows PowerShell）：
+> ```powershell
+> Invoke-WebRequest https://raw.githubusercontent.com/winter646258/hash-forensics-agent/main/agent.py -OutFile agent.py
+> Invoke-WebRequest https://raw.githubusercontent.com/winter646258/hash-forensics-agent/main/toolkit.py -OutFile toolkit.py
+> ```
+
+### 版本要求
+
+| 组件 | 要求 | 说明 |
+|---|---|---|
+| Python | 3.8+ | 推荐 3.10+（`sqlite3`、`zipfile` 均为标准库） |
+| 操作系统 | Windows / macOS / Linux | 在 Windows 11 上开发验证 |
+| 磁盘 | ≥ 10 MB | 不含自建词表；大规模词表建议放非同步盘 |
+| 网络 | 不需要 | 仅在接入云端大模型 API 时需要 |
+| 第三方库 | **无** | 纯标准库实现 |
+
+---
+
+## 快速开始
+
+代码下载好后，进入项目目录：
+
+```bash
+# 1. 进入项目目录（按你的实际解压路径）
+cd hash-forensics-agent
 
 # 2. 自动演示（10+ 句预设对话，含内存实测）
 python agent.py demo
@@ -39,6 +84,10 @@ python agent.py demo
 # 3. 交互模式（自己随便问）
 python agent.py
 ```
+
+> **Windows 提示**：若 `python` 命令不可用，用绝对路径调用，例如
+> `& "C:\Python312\python.exe" agent.py demo`；
+> 中文输出乱码时先执行 `$env:PYTHONIOENCODING="utf-8"`。
 
 启动后会看到这样的横幅，然后像聊天一样输入中文即可：
 
@@ -440,14 +489,48 @@ $env:PYTHONIOENCODING = "utf-8"
 | v1.1 | 组合意图、中文夹串、FAQ 扩充 | ✅ 已完成 |
 | v1.2 | 正向计算自动入表 + 查表反查闭环 | ✅ 已完成 |
 | v2.0 | 大模型理解层（function calling + 白名单 + 降级） | ✅ 已完成 |
-| v2.1 | 本地模型实测通过、返回值归一化、参数容错 | ✅ 当前版本 |
-| **v2.2** | **碰撞生成意图**（调 fastcoll 一句话造碰撞对并验证） | 待做 |
-| v2.3 | 对照表迁移到 SQLite（支撑十万级词表） | 待做 |
-| v2.4 | 字典规则引擎（leet、大小写、生日后缀等变换） | 待做 |
-| v2.5 | 加密容器口令恢复（zip/7z/Office） | 待做 |
-| v2.6 | 参数级白名单（限制可访问目录，防提示注入） | 待做 |
+| v2.1 | 本地模型实测通过、返回值归一化、参数容错 | ✅ 已完成 |
+| v2.3-Step1 | 对照表迁移到 SQLite（内存与表规模解耦） | ✅ 已完成 |
+| **v2.3-Step2** | **字典规则引擎（leet、大小写、数字/年份后缀）** | 进行中 |
+| v2.3-Step3 | 参数级白名单（限制可访问目录，防提示注入） | 待做 |
+| v2.3-Step4 | 加密容器口令恢复（zip / Office） | 待做 |
+| v2.2 | 碰撞生成意图（调 fastcoll 一句话造碰撞对并验证） | 待做 |
 | v3.0 | 多步任务规划（模型拆解计划 + 逐步执行 + 安全闸） | 规划中 |
 | v3.1 | 国密扩展（SM4 对称加密、SM2 签名验签） | 规划中 |
+
+> 详细的分步实施规格见 [UPGRADE-v2.3.md](UPGRADE-v2.3.md)。
+
+---
+
+## 开发与更新
+
+```bash
+# 拉取最新代码
+git pull
+
+# 运行（无构建步骤、无依赖安装）
+python agent.py demo
+
+# 语法自检
+python -m py_compile agent.py toolkit.py db.py
+```
+
+**项目约定**
+
+| 约定 | 说明 |
+|---|---|
+| 仅用标准库 | 不引入任何第三方依赖，保证"拷走即用" |
+| 数据文件不入库 | `*.db` / `hash_table.json` / `agent_audit.log` 均在 `.gitignore` 中 |
+| 数据库位置可配 | 环境变量 `HFA_DB_PATH` 指定路径（大规模词表建议放 `D:\` 等非同步盘） |
+| 审计留痕 | 每次操作写 `agent_audit.log` |
+
+**运行时会生成的文件**（均已被 `.gitignore` 忽略）
+
+```
+hash_index.db          本地对照表（SQLite）
+agent_audit.log        审计日志
+hash_manifest.json     工具箱批量哈希清单
+```
 
 ---
 
