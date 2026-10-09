@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 运行时生成的本地数据（含操作记录，不入库）
+hash_table.json
+agent_audit.log
+hash_manifest.json
+
+# 模型文件
+*.gguf
+*.bin
+*.safetensors
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
