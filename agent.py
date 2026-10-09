@@ -23,6 +23,7 @@ import sys
 import time
 
 import toolkit as exp5  # 行动层：复用取证工具箱的哈希/校验/去重/破解函数
+import db               # 存储层：SQLite 对照表（v2.3 Step 1，内存与表规模解耦）
 
 # ---------------- 路径常量：全部锚定到项目目录，克隆后开箱即用 ----------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,35 +31,51 @@ SAMPLES = os.path.join(_HERE, "samples")           # 演示样本目录
 DEFAULT_DEDUP_DIR = os.path.join(SAMPLES, "screening")
 
 # ----------------------------------------------------------------
-# 本地对照表（持久化）：正向算过的"哈希→明文"自动写入，查表时自动加载
-#   存储：hash_table.json（MD5/SHA-256 各一张）——仅标准库，O(1) dict 查询
+# 本地对照表（持久化）：正向算过的"哈希→明文"自动写入，查表时按需查询
+#   存储：SQLite hash_index 表（db.py）——仅标准库；BLOB 摘要 + WITHOUT ROWID 聚簇主键
+#   旧版 hash_table.json 若存在且表为空，connect() 时自动迁移为 .migrated.bak
 #   注意：这是"查表反查"，命中前提 = 原文曾被正向算过并存入；不是解密。
 # ----------------------------------------------------------------
-TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hash_table.json")
+TABLE_PATH = os.path.join(_HERE, "hash_table.json")   # 仅保留为旧表迁移路径与提示文案
 
 
 def load_table():
-    if os.path.isfile(TABLE_PATH):
-        with open(TABLE_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return {"MD5": {}, "SHA-256": {}}
+    """返回对照表视图：{"MD5": AlgoView, "SHA-256": AlgoView}。
+
+    结构与旧版 dict 完全一致（支持 t[algo][hex]、in、len），但读写都落在 SQLite 上，
+    不再把全表载入内存——内存占用与表规模解耦。
+    """
+    return db.load_view()
 
 
 def save_table(table):
-    with open(TABLE_PATH, "w", encoding="utf-8") as f:
-        json.dump(table, f, ensure_ascii=False, indent=1)
+    """兼容旧调用：把对照表落盘到 SQLite。
+
+    旧版是"全量覆写 JSON"。现在分两种情况：
+      * 值是 db.AlgoView（load_table() 的返回）→ 刷写入缓冲即可；
+      * 值是老式纯 dict（外部代码手工构造）→ 逐条写入数据库，行为与旧版一致。
+    调用后数据都持久可用，外部行为不变。
+    """
+    if isinstance(table, dict):
+        for algo, store in table.items():
+            if hasattr(store, "flush"):
+                store.flush()
+            elif isinstance(store, dict):          # 老式纯 dict：逐条落库
+                for digest_hex, plaintext in store.items():
+                    db.put(algo, digest_hex, plaintext)
+    db.flush()
 
 
 def remember(plaintext, table=None):
     """正向算 MD5+SHA-256 并自动写入本地对照表。返回 (md5, sha256)。"""
-    if table is None:
-        table = load_table()
     data = plaintext.encode("utf-8")
     md5 = hashlib.md5(data).hexdigest()
     sha = hashlib.sha256(data).hexdigest()
-    table["MD5"][md5] = plaintext
-    table["SHA-256"][sha] = plaintext
-    save_table(table)
+    if table is None:                 # 直接写数据库（一次事务两条）
+        db.remember(plaintext)
+    else:                             # 写入调用方给的视图，由 save_table 统一落盘
+        table["MD5"][md5] = plaintext
+        table["SHA-256"][sha] = plaintext
     return md5, sha
 
 # ----------------------------------------------------------------
@@ -308,6 +325,7 @@ def decide_act(intent, p):
         table = load_table()
         before = len(table["MD5"])
         remember(p["content"], table)  # 自动入表
+        save_table(table)              # 落盘（SQLite 写入）
         note = ""
         if val in KNOWN_MD5:
             note = "（该值恰在内置样本库中 → 对应口令 %s）" % KNOWN_MD5[val]
@@ -355,29 +373,19 @@ def decide_act(intent, p):
 
     if intent == "build_table":
         # 建表：把词表文件逐行正向算 MD5+SHA-256 写入本地对照表（行数即词条数）
+        # v2.3：改走 db.import_wordlist 流式导入（每 1 万条一事务），内存不随词表增长
         src = p.get("file")
         if not src or not os.path.isfile(src):
             return {"ok": False, "action": "build_table", "result": None,
                     "advice": "需要词表文件（每行一个候选明文）。示例：建表 D:\\wordlist.txt。"
                               "没有词表可用“加密：xxx，用md5算法”逐条攒表。"}
-        table = load_table()
-        before = len(table["MD5"])
-        cnt = 0
-        with open(src, "rb") as f:
-            for raw in f:
-                line = raw.rstrip(b"\r\n")
-                if not line:
-                    continue
-                md5 = hashlib.md5(line).hexdigest()
-                sha = hashlib.sha256(line).hexdigest()
-                table["MD5"][md5] = line.decode("utf-8", errors="replace")
-                table["SHA-256"][sha] = table["MD5"][md5]
-                cnt += 1
-        save_table(table)
+        res = db.import_wordlist(src, algos=("MD5", "SHA-256"),
+                                 source="wordlist:" + os.path.basename(src))
         return {"ok": True, "action": "build_table",
-                "result": "导入 %d 条，对照表现有 %d 条（MD5+SHA-256 双索引）" % (cnt, len(table["MD5"])),
+                "result": "导入 %d 条，对照表现有 %d 条（MD5+SHA-256 双索引）"
+                          % (res["lines"], res["counts"]["MD5"]),
                 "advice": "已写入 %s。今后 crack 意图会自动查这张表——查表是反查不是解密，"
-                          "命中前提 = 原文在词表里。" % TABLE_PATH}
+                          "命中前提 = 原文在词表里。" % db.db_path()}
 
     if intent == "verify":
         path = p["path"]
@@ -520,7 +528,7 @@ DEMO_INPUTS_V11 = [
 ]
 # v1.2 新增：自动入表 → 重启级查表反查（验证跨会话持久化）
 DEMO_INPUTS_V12 = [
-    "加密：062481，用md5算法",     # 正向计算 → 自动写入 hash_table.json
+    "加密：062481，用md5算法",     # 正向计算 → 自动写入 SQLite 对照表 hash_index.db
     "解密 " + hashlib.md5("062481".encode()).hexdigest(),  # 拿刚才的 MD5 来查表 → 应命中 062481
 ]
 

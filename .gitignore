@@ -12,6 +12,11 @@ hash_table.json
 agent_audit.log
 hash_manifest.json
 
+# SQLite 对照表（v2.3）：数据库可能达 GB 级，绝不入库
+*.db
+*.db-wal
+*.db-shm
+
 # 模型文件
 *.gguf
 *.bin
