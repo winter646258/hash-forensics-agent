@@ -15,6 +15,7 @@ db.py —— HashForensics Agent 存储层（SQLite 底座，v2.3 · Step 1）
   remember(plaintext, source="compute")         正向算 MD5+SHA-256 入库，返回新增行数
   lookup(algo, digest_hex)                      按 hex 摘要反查明文，未命中返回 None
   import_wordlist(path, algos, rules, source)   词表逐行导入（批量事务，内存恒定）
+                                                rules=min|std|max 走 Step 2 规则引擎
   stats()                                       各算法条数 + 磁盘占用
   migrate_from_json(json_path)                  迁移旧 JSON 表，成功后原文件改名 .migrated.bak
   load_view()                                   兼容 agent.py 旧 dict 语义的惰性视图
@@ -47,6 +48,14 @@ JSON_TABLE_PATH = os.path.join(_HERE, JSON_NAME)
 DEFAULT_ALGOS = ("MD5", "SHA-256")   # 正向计算默认双索引
 BATCH = 10000                        # 批量事务条数：内存恒定，不随词表大小增长
 FLUSH_EVERY = 2000                   # 视图写入缓冲阈值（防止调用方一边写一边撑内存）
+BASE_CACHE_KB = 8000                 # 稳态页缓存 8MB（Step 1 设计：不随表规模增长）
+BULK_CACHE_KB = 32000                # 导入期临时页缓存 32MB（见 _bulk_tuning 注释）
+WORKER_LIMIT = 8                     # 多进程导入的最大子进程数（再多就只是抢磁盘了）
+CHUNK = 20000                        # 多进程分片的最大原始行数
+TARGET_TASK_ROWS = 50000             # 每个子进程任务的回传行数上限（控制 pickle 体积）
+BASE_AUTOCHECKPOINT = 8000           # 稳态 WAL 自动检查点（Step 1 的调优值）
+BULK_AUTOCHECKPOINT = 32000          # 导入期放宽自动检查点（见 _bulk_tuning 注释）
+PARALLEL_MIN_VARIANTS = 200000       # 候选变体超过这个量才值得起进程池（建池约 0.3 秒）
 
 _HASHERS = {
     "MD5": hashlib.md5,
@@ -79,6 +88,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 # 模块级连接缓存：进程内复用同一个连接（= 同一份 8MB 页缓存，不重复占用）
 _CONN = None
 _CONN_PATH = None
+_RULES_MOD = None      # Step 2 规则引擎的惰性缓存（不传 rules 就不导入 rules.py）
 
 
 # ---------------------------------------------------------------- 工具
@@ -212,6 +222,51 @@ def _insert_many(rows, sql=_SQL_INSERT):
 
 
 # ---------------------------------------------------------------- 写入 / 查询
+class _bulk_tuning(object):
+    """导入期临时放大页缓存的上下文管理器（Step 2 性能补充）。
+
+    为什么需要：摘要 BLOB 近似随机分布，WITHOUT ROWID 聚簇主键的插入会随机触碰
+    B 树页；Step 1 固定的 8MB 缓存（cache_size=-8000）在库涨到几百 MB 后命中率极低，
+    每次插入近乎一次随机页读。实测导入 84 万行：
+        8MB / synchronous=NORMAL  → 66.0 秒（12.7k 行/秒）
+        32MB / synchronous=NORMAL → 46.0 秒（18.3k 行/秒）  峰值 RSS 66.9MB
+    取 32MB 而非更大的 64/128MB：32MB 已拿到主要收益，且峰值 RSS 稳稳落在
+    升级书第 6 节「30~90MB」预算内（64MB → 102MB、128MB → 169MB 会顶破预算）。
+
+    **不关闭 synchronous**：sync=OFF 再快 1.5 倍，但代价是断电/崩溃可能损坏整个
+    数据库文件；口令对照表重算成本极高，这个赌注不值当。
+
+    退出时恢复 8MB 稳态缓存——"页缓存固定"仍是本模块的常态，放大只发生在导入期间。
+    """
+
+    def __init__(self, cache_kb=BULK_CACHE_KB):
+        self.cache_kb = cache_kb
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = _conn()
+        self.conn.execute("PRAGMA cache_size = %d" % (-self.cache_kb,))
+        self.conn.execute("PRAGMA wal_autocheckpoint = %d" % (BULK_AUTOCHECKPOINT,))
+        return self.conn
+
+    def __exit__(self, *exc):
+        try:
+            self.conn.execute("PRAGMA cache_size = -%d" % (BASE_CACHE_KB,))
+            self.conn.execute("PRAGMA wal_autocheckpoint = %d" % (BASE_AUTOCHECKPOINT,))
+        except Exception:
+            pass
+        return False
+
+
+def _checkpoint(conn):
+    """把 WAL 收回主库文件（导入收尾用）。失败不影响导入结果，只是磁盘可能偏大。"""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return True
+    except Exception:
+        return False
+
+
 def remember(plaintext, source="compute"):
     """正向算 MD5 + SHA-256 并写入 hash_index。返回实际新增的行数（重复条目计 0）。"""
     if not isinstance(plaintext, str):
@@ -264,46 +319,379 @@ def count(algo=None):
                         (normalize_algo(algo),)).fetchone()[0]
 
 
-def import_wordlist(path, algos=DEFAULT_ALGOS, rules=None, source=None):
-    """词表逐行导入：读一行 → 算摘要 → 批量事务插入（每 BATCH 条一事务）。
+def _estimate_variants(path, level, sample=64, limit=None):
+    """估算词表在给定档位下的变体总数（导入前预估，回答"这条命令要写多少行"）。
 
-    内存恒定，不随词表大小增长（对照旧方案：JSON 需全量载入再全量覆写）。
-    rules 参数为 Step 2 的规则档位预留；本步骤仅支持 rules=None。
-    返回 {'file','lines','inserted','algos','source','counts'}。
+    抽样 ``sample`` 条有效行求平均，再乘总行数——避免为了报个数把整表展开一遍
+    （max 档 ×800，全表展开一次就是纯浪费）。词表短于 sample 时全量精确计数。
     """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-    if rules:
-        try:
-            import rules as _rules  # noqa: F401  Step 2 才落地
-        except ImportError:
-            raise NotImplementedError(
-                "规则档位 rules=%r 需要 Step 2 的 rules.py；本步骤（Step 1）仅支持 rules=None。" % (rules,))
-    algos = tuple(normalize_algo(a) for a in (algos or DEFAULT_ALGOS))
-    for a in algos:
-        if a not in _HASHERS:
-            raise ValueError("不支持的算法 %r（当前支持 %s）" % (a, "/".join(sorted(_HASHERS))))
-    src = source or ("wordlist:" + os.path.basename(path))
-    ts = _now()
-    lines = inserted = 0
-    buf = []
+    if level is None:
+        return _count_wordlist(path, limit)
+    mod = _load_rules()
+    texts, total = [], _count_wordlist(path, limit)
+    if total == 0:
+        return 0
     with open(path, "rb") as f:
         for raw in f:
             line = raw.rstrip(b"\r\n")
             if not line:
                 continue
-            lines += 1
-            text = line.decode("utf-8", errors="replace")
-            for a in algos:
-                buf.append((a, _HASHERS[a](line).digest(), text, src, ts))
-            if len(buf) >= BATCH:
-                inserted += _insert_many(buf)
-                buf = []
+            texts.append(line.decode("utf-8", errors="replace"))
+            if len(texts) >= sample:
+                break
+    if not texts:
+        return 0
+    if total <= len(texts):                      # 短词表：精确
+        return sum(mod.count_variants(t, level) for t in texts)
+    avg = sum(mod.count_variants(t, level) for t in texts) / float(len(texts))
+    return int(round(avg * total))
+
+
+def _plan_tasks(path, level, limit=None):
+    """把词表切成若干任务，且**不让单个任务的回传体积过大**。
+
+    关键：max 档单条约 ×800，fixed 行数分片会让一个任务回传几十万行、
+    pickle 一大块内存。这里按"估算变体数"折算每个任务该分多少原始行：
+    目标每任务 ≤ TARGET_TASK_ROWS 个候选明文，行数再被 CHUNK 封顶。
+    任务数由数据量决定（多于进程数才能让 worker 之间负载均衡）。
+    """
+    total = _count_wordlist(path, limit)
+    if total == 0:
+        return []
+    est = max(_estimate_variants(path, level, limit=limit), 1)
+    rows_per_task = max(1, min(CHUNK, TARGET_TASK_ROWS * total // est))
+    n = max(1, -(-total // rows_per_task))       # 向上取整
+    tasks, start = [], 0
+    for _ in range(n):
+        if start >= total:
+            break
+        tasks.append((start, rows_per_task))
+        start += rows_per_task
+    return tasks
+
+
+def _load_rules():
+    """惰性导入 Step 2 的规则引擎。rules.py 缺失时给出明确中文错误，不静默降级。
+
+    惰性导入的好处：不传 rules 时 rules.py 不参与、也不影响旧调用方的加载时间。
+    """
+    global _RULES_MOD
+    if _RULES_MOD is None:
+        try:
+            import rules as _rules
+        except ImportError as exc:
+            raise ImportError("规则档位需要同目录的 rules.py（Step 2 模块）：%s" % exc)
+        _RULES_MOD = _rules
+    return _RULES_MOD
+
+
+def _normalize_level(rules):
+    """rules 参数归一化：None/''/raw → 裸字典 None；否则返回校验过的档位名。
+
+    Step 1 里传非空值会抛 NotImplementedError；Step 2 起真正接上 rules.variants。
+    档位非法仍抛 ValueError——不静默降级，免得用户以为跑了 std 其实只跑了裸字典。
+    """
+    if rules is None or rules is False or rules == "":
+        return None
+    if rules is True:
+        return _load_rules().DEFAULT_LEVEL
+    if not isinstance(rules, str):
+        raise ValueError("rules 应为 min/std/max 或 None，收到 %r" % (rules,))
+    lv = rules.strip().lower()
+    if lv in ("none", "raw", "off", "0"):
+        return None
+    mod = _load_rules()
+    if lv not in mod.LEVELS:
+        raise ValueError("未知规则档位 %r（可选：%s）" % (rules, " / ".join(mod.LEVELS)))
+    return lv
+
+
+def _resolve_processes(processes):
+    """解析 processes 参数：None/0/1 → 单进程；'auto' → min(CPU 核数, WORKER_LIMIT)。"""
+    if processes in (None, 0, 1, "1"):
+        return 1
+    if isinstance(processes, str):
+        s = processes.strip().lower()
+        if s in ("auto", "true", "yes", "on"):
+            return max(1, min(os.cpu_count() or 1, WORKER_LIMIT))
+        try:
+            processes = int(s)
+        except ValueError:
+            raise ValueError("processes 应为整数或 'auto'，收到 %r" % (processes,))
+    n = int(processes)
+    if n < 1:
+        return 1
+    return min(n, 64)                      # 上限兜底，防止手滑传 9999
+
+
+def _count_wordlist(path, limit=None):
+    """数一遍词表有多少条有效行（空行不计）——多进程分片边界与进度用。
+
+    相对哈希计算这是极廉价的一次遍历（1 万行约几毫秒）。
+    """
+    n = 0
+    with open(path, "rb") as f:
+        for raw in f:
+            if raw.rstrip(b"\r\n"):
+                n += 1
+                if limit and n >= limit:
+                    break
+    return n
+
+
+def _iter_lines(path, limit=None):
+    """流式读词表：逐行 yield (序号, 原始字节, 文本)，空行跳过。内存恒定。"""
+    i = 0
+    with open(path, "rb") as f:
+        for raw in f:
+            line = raw.rstrip(b"\r\n")
+            if not line:
+                continue
+            i += 1
+            yield i, line, line.decode("utf-8", errors="replace")
+            if limit and i >= limit:
+                return
+
+
+def _hash_rows(words, algos, src, ts):
+    """候选明文（bytes）→ 待插入行。返回 (rows, 候选条数)。
+
+    批内按 (algo, digest) 再去一次重：词表重复行、规则档位把不同词条映射到同一变体
+    都属常见，去掉后能省下可观的 executemany 开销（SQLite 反正也会 OR IGNORE）。
+    """
+    rows, seen, n = [], set(), 0
+    for w in words:
+        if not w:
+            continue
+        n += 1
+        text = None
+        for a in algos:
+            d = _HASHERS[a](w).digest()
+            key = (a, d)
+            if key in seen:
+                continue
+            seen.add(key)
+            if text is None:
+                text = w.decode("utf-8", errors="replace")
+            rows.append((a, d, text, src, ts))
+    return rows, n
+
+
+def _gen_candidates(path, level, limit=None):
+    """候选明文流：裸字典 = 原样行；规则档位 = 每行经 rules.variants 变形。
+
+    这是文档里"流式管道"的核心——生成器套生成器，全程不构造完整列表，
+    所以内存占用与词表规模、档位扩充倍数都无关。
+    """
+    for _i, line, text in _iter_lines(path, limit):
+        if level is None:
+            yield line
+        else:
+            for v in _load_rules().variants(text, level):
+                yield v.encode("utf-8")
+
+
+def _row_sort_key(row):
+    """批内排序键：(algo, digest)。让聚簇主键的插入页访问局部化。"""
+    return (row[0], row[1])
+
+
+def _import_single(path, algos, level, src, limit=None, progress=False):
+    """单进程流式导入：生成候选 → 每 BATCH 条一事务。返回 (变更行数, 候选条数)。
+
+    批内按摘要排序后再 executemany：主键是聚簇的 (algo, digest)，乱序插入会
+    随机触碰 B 树页，排一下让同批的页访问局部化（实测 84 万行 40.9 → 34.1 秒）。
+    """
+    ts = _now()
+    buf, inserted, n = [], 0, 0
+    for cand in _gen_candidates(path, level, limit):
+        buf.append(cand)
+        if len(buf) >= BATCH:
+            rows, k = _hash_rows(buf, algos, src, ts)
+            rows.sort(key=_row_sort_key)
+            inserted += _insert_many(rows)
+            n += k
+            buf = []
+            if progress and n % (BATCH * 10) == 0:
+                sys.stderr.write("  [import] 已处理 %d 条候选…\n" % n)
+                sys.stderr.flush()
     if buf:
-        inserted += _insert_many(buf)
-    return {"file": os.path.abspath(path), "lines": lines, "inserted": inserted,
-            "algos": list(algos), "source": src,
-            "counts": {a: count(a) for a in algos}}
+        rows, k = _hash_rows(buf, algos, src, ts)
+        rows.sort(key=_row_sort_key)
+        inserted += _insert_many(rows)
+        n += k
+    return inserted, n
+
+
+def _region_words(path, start, count, limit=None):
+    """子进程任务：读原始行区间 [start, start+count)，返回原始行（bytes）。
+
+    分片按**原始行**切，不按变体切——一条词条的全部变体必落在同一子进程里。
+    """
+    out, i, taken = [], 0, 0
+    with open(path, "rb") as f:
+        for raw in f:
+            line = raw.rstrip(b"\r\n")
+            if not line:
+                continue
+            i += 1
+            if i <= start:
+                continue
+            out.append(line)
+            taken += 1
+            if taken >= count or (limit and i >= limit):
+                break
+    return out
+
+
+def _spawn_ready():
+    r"""检查多进程 spawn 是否**真的可用**。返回 (ok, 原因)。
+
+    Windows 只有 spawn 一种上下文，而 spawn 要求子进程能重新导入 ``__main__``。
+    两种情况会直接崩在子进程里：
+      ① 主模块不可导入——`python -c "..."`、管道/标准输入、交互式 REPL
+         （__main__.__file__ 是 '<stdin>' / '<string>' 甚至不存在）；
+         报错形如 ``OSError: [Errno 22] Invalid argument: '...\<stdin>'``。
+      ② 当前进程本身就是 spawn 出来的子进程——再开池会递归爆炸
+         （未加 `if __name__ == "__main__":` 保护的脚本会踩到）。
+    这两种都提前判掉，退回单进程，不让用户看到栈回溯。
+    """
+    import multiprocessing as mp
+    if mp.current_process().name != "MainProcess":
+        return False, "当前进程本身是子进程（避免 spawn 递归）"
+    f = getattr(sys.modules.get("__main__"), "__file__", None) or ""
+    if not f or f.startswith("<") or not os.path.isfile(f):
+        return False, "主模块不可被重新导入（python -c / 标准输入 / 交互模式）"
+    return True, None
+
+
+def _worker(args):
+    """多进程子进程入口：只做 CPU（展开变体 + 算摘要），批量把 row 回传主进程。
+
+    子进程**不写库**：SQLite 是单写入者模型，多进程同时写同一库文件只会互相锁。
+    rows 已按摘要排好序，主进程直接 executemany。
+    """
+    path, start, count, algos, level, src, ts = args
+    words = _region_words(path, start, count)
+    if level is not None:
+        mod = _load_rules()
+        words = [v.encode("utf-8") for w in words
+                 for v in mod.variants(w.decode("utf-8", errors="replace"), level)]
+    rows, n = _hash_rows(words, algos, src, ts)
+    rows.sort(key=_row_sort_key)
+    return rows, n
+
+
+def _import_parallel(path, algos, level, src, nproc, limit=None):
+    """多进程分片导入：子进程并行算摘要，主进程串行批量落库。
+
+    返回 (变更行数, 候选条数)——与 _import_single 返回结构一致，调用方无需分支。
+    结果与单进程完全一致（同一套规则、同一套主键，只是任务被切了片）。
+    任何环节不可用（spawn 前提不满足、建池失败、子进程执行期崩溃）→ 一律
+    **自动降级单进程**并说明原因；因为 (algo, digest) 是主键且用 INSERT OR IGNORE，
+    即便已写入一部分再重做整份词表，也不会产生重复行（幂等）。
+    """
+    import multiprocessing as mp
+    ready, why = _spawn_ready()
+    if not ready:
+        sys.stderr.write("[import] 多进程不可用（%s），自动降级单进程。\n" % why)
+        sys.stderr.flush()
+        return _import_single(path, algos, level, src, limit)
+
+    pool = None
+    inserted = n = 0
+    try:
+        ctx = mp.get_context("spawn")     # Windows 只能用 spawn
+        pool = ctx.Pool(processes=nproc)
+        ts = _now()
+        # _plan_tasks 返回 (start, count) 的 2 元组；在此补全 worker 需要的 7 元组
+        tasks = [(path, start, count, algos, level, src, ts)
+                 for (start, count) in _plan_tasks(path, level, limit)]
+        for rows, k in pool.imap_unordered(_worker, tasks, chunksize=1):
+            inserted += _insert_many(rows)
+            n += k
+    except Exception as exc:
+        # 覆盖建池 **与执行阶段** 的失败（spawn 的 OSError、worker 异常等）
+        sys.stderr.write("[import] 多进程失败（%s: %s），自动降级单进程重跑。\n"
+                         % (type(exc).__name__, exc))
+        sys.stderr.flush()
+        if pool is not None:
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+        pool = None
+        return _import_single(path, algos, level, src, limit)
+    finally:
+        if pool is not None:
+            try:
+                pool.close()
+                pool.join()
+            except Exception:
+                pass
+    return inserted, n
+
+
+def import_wordlist(path, algos=DEFAULT_ALGOS, rules=None, source=None,
+                    processes=None, progress=False, limit=None):
+    """词表逐行导入：读一行 → 生成变体 → 算摘要 → 批量事务插入（每 BATCH 条一事务）。
+
+    内存恒定，不随词表大小增长（对照旧方案：JSON 需全量载入再全量覆写）。
+    Step 2 起 ``rules`` 走 rules.py 的流式变形引擎。
+
+    algos     要建索引的算法，默认 MD5 + SHA-256
+    rules     规则档位：None = 裸字典（原样一行）；"min"/"std"/"max" = 规则变形
+    source    写入 source 字段；缺省按档位生成 'wordlist:文件' 或 'wordlist:文件#std'
+    processes 多进程分片：None/1 = 单进程；N = 子进程数；"auto" = 按 CPU 核数
+    progress  置 True 向 stderr 打进度心跳（大词表导入用）
+    limit     只导入前 N 行（基准测试用；正式导入不要传）
+
+    返回 {'file','rules','lines','variants','inserted','algos','source','counts',
+          'elapsed','rate','processes'}。
+
+    幂等性：(algo, digest) 主键 + INSERT OR IGNORE → 同词表重复导入不产生重复行，
+    行数严格不翻倍，重跑/断点续传安全。
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    level = _normalize_level(rules)
+    algos = tuple(normalize_algo(a) for a in (algos or DEFAULT_ALGOS))
+    for a in algos:
+        if a not in _HASHERS:
+            raise ValueError("不支持的算法 %r（当前支持 %s）" % (a, "/".join(sorted(_HASHERS))))
+    src = source or ("wordlist:" + os.path.basename(path)
+                     + (("#" + level) if level else ""))
+    lines = _count_wordlist(path, limit)
+    # 并行开关看**候选变体量**，不是原始行数：1 万行 × std 档 = 210 万变体，
+    # 比 2 万行裸字典重得多，按行数判断会让它悄悄跑单进程（早期实测踩过这个坑）。
+    est_variants = _estimate_variants(path, level, limit=limit)
+    nproc = _resolve_processes(processes)
+    if nproc == 1 and est_variants > PARALLEL_MIN_VARIANTS and processes is None:
+        # 默认档：量够大就自动上多进程；显式传 processes=1 仍尊重用户选择。
+        nproc = _resolve_processes("auto")
+    t0 = time.time()
+    if progress:
+        hint = ("（%s 档：单条约 ×%d，预估共 %d 个变体）"
+                % (level, _load_rules().count_variants("password", level), est_variants)
+                if level else "（裸字典）")
+        sys.stderr.write("[import] %s  lines=%d  rules=%s%s  algos=%s  procs=%d\n"
+                         % (os.path.basename(path), lines, level or "raw", hint,
+                            "+".join(algos), nproc))
+        sys.stderr.flush()
+    with _bulk_tuning():                   # 导入期放大页缓存，退出自动恢复 8MB
+        if nproc > 1 and est_variants > PARALLEL_MIN_VARIANTS:
+            inserted, variants_n = _import_parallel(path, algos, level, src, nproc, limit)
+        else:
+            inserted, variants_n = _import_single(path, algos, level, src, limit, progress)
+    if nproc > 1:
+        _checkpoint(_conn())               # 收尾把 WAL 收回主库文件
+    elapsed = time.time() - t0
+    return {"file": os.path.abspath(path), "rules": level, "lines": lines,
+            "variants": variants_n, "inserted": inserted, "algos": list(algos),
+            "source": src, "counts": {a: count(a) for a in algos},
+            "elapsed": round(elapsed, 3),
+            "rate": int(variants_n / elapsed) if elapsed > 0 else 0,
+            "processes": nproc}
 
 
 def _meta_set(conn, key, value):

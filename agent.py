@@ -24,6 +24,7 @@ import time
 
 import toolkit as exp5  # 行动层：复用取证工具箱的哈希/校验/去重/破解函数
 import db               # 存储层：SQLite 对照表（v2.3 Step 1，内存与表规模解耦）
+import rules            # 规则引擎：字典变形三档（v2.3 Step 2，流式生成）
 
 # ---------------- 路径常量：全部锚定到项目目录，克隆后开箱即用 ----------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -127,7 +128,7 @@ LLM_TOOLS_SPEC = [
     {"action": "crack", "params": ["hash"], "desc": "用户给出哈希值，想反查原文（查表）"},
     {"action": "verify", "params": ["path"], "desc": "校验某文件的完整性（双哈希比对）"},
     {"action": "dedup", "params": ["dir"], "desc": "对目录内文件按内容去重"},
-    {"action": "build_table", "params": ["file"], "desc": "把词表文件逐行正向算哈希写入本地对照表"},
+    {"action": "build_table", "params": ["file", "rules"], "desc": "把词表文件逐行正向算哈希写入本地对照表。可选 rules 参数指定变形档位：min（原名/大小写，×4）、std（默认：加数字/年份/符号后缀，覆盖 password123 这类弱口令）、max（再加 leet/反转/前后缀/双词拼接）。用户说'建表 词表.txt rules=std'时 rules 填 std"},
     {"action": "crack_then_verify", "params": ["hash"], "desc": "先查表破解哈希，再用原文与样本文件比对是否同一来源"},
     {"action": "faq", "params": ["question"], "desc": "哈希取证原理类提问（为什么/是什么/区别/原理）"},
 ]
@@ -144,6 +145,8 @@ LLM_PROMPT = (
     '用户：校验 hello.txt → 输出 {"action":"verify","path":"hello.txt"}\n'
     '用户：对screening去重 → 输出 {"action":"dedup","dir":"screening"}\n'
     '用户：为什么要双哈希 → 输出 {"action":"faq","question":"为什么要双哈希"}\n'
+    '用户：建表 wordlist.txt rules=std → 输出 {"action":"build_table","file":"wordlist.txt","rules":"std"}\n'
+    '用户：用max档建表 zidian.txt → 输出 {"action":"build_table","file":"zidian.txt","rules":"max"}\n'
     "工具清单：%s" % json.dumps(LLM_TOOLS_SPEC, ensure_ascii=False)
 )
 
@@ -186,6 +189,12 @@ def llm_perceive(text):
             cmd["algo"] = cmd["algo"].upper().replace("SHA-", "SHA-").replace("_", "-")
             if cmd["algo"].startswith("SHA"):  # 归一化 sha256 → SHA-256
                 cmd["algo"] = "SHA-" + cmd["algo"][4:].lstrip("-")
+        if action == "build_table":
+            # v2.3：模型可能给 rules/level/档位 等近义键，统一归一化到 rules 白名单
+            raw = cmd.get("rules", cmd.get("level", cmd.get("档位")))
+            cmd["rules"] = parse_rule_level(str(raw or ""), DEFAULT_RULE_LEVEL)
+            if cmd["rules"] not in RULE_LEVELS:
+                cmd["rules"] = DEFAULT_RULE_LEVEL
         p = {k: v for k, v in cmd.items() if k != "action"}
         return action, p
     except Exception:
@@ -227,6 +236,25 @@ GESTURE_TARGET = "36F6A527314C7DD2D71A6A36703ADF314E14F28B"
 
 SLOW_HASHES = ("bcrypt",)  # 慢哈希：拒绝盲目穷举，给成本评估（这是"智能"的体现）
 
+# v2.3 Step 2：字典规则档位（规则层与 LLM 层共用同一份白名单与解析函数）
+RULE_LEVELS = rules.LEVELS            # ("min", "std", "max")
+DEFAULT_RULE_LEVEL = rules.DEFAULT_LEVEL   # "std"
+
+
+def parse_rule_level(text, default=None):
+    """从一句话里抽出规则档位：`rules=std` / `档位 max` / `规则 min` / 裸词 `std 档`。
+
+    未提及档位时返回 default（build_table 行动层用 DEFAULT_RULE_LEVEL = std）。
+    只认白名单内的三个词，避免把 "min" 之外的英文单词误当档位。
+    """
+    t = str(text or "")
+    m = re.search(r"(?:rules?|档位|规则)\s*[:：=]?\s*(min|std|max)\b", t, re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(min|std|max)\b\s*(?:档|级别|level)?", t, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return default
+
 
 def perceive(text):
     """感知：返回 (意图, 参数)。顺序即优先级。v1.1：支持夹在中文里的哈希串、组合意图。"""
@@ -265,10 +293,15 @@ def perceive(text):
             content = re.sub(r"^[\s:：,，。=、?？!！]+|[\s:：,，。=、?？!！]+$", "", content)
             if content:
                 return "hash_compute", {"content": content, "algo": algo}
-    # 3) 建表意图：“建表 <文件>”（把词表逐行算哈希写入本地对照表）
+    # 3) 建表意图：“建表 <文件> [rules=std]”（把词表逐行算哈希写入本地对照表）
+    #    v2.3 Step 2：支持规则档位——建表、词表.txt、档位、rules=std、规则 std 等写法都认
     m_build = re.search(r"建表\s*[:：]?\s*([\w\u4e00-\u9fff\\/:.]+\.(?:txt|dic|lst))?", t)
     if m_build and re.search(r"建表", t):
-        return "build_table", {"file": m_build.group(1)}
+        p = {"file": m_build.group(1)}
+        lv = parse_rule_level(t)
+        if lv:
+            p["rules"] = lv
+        return "build_table", p
     # 4) 文件类意图
     path = re.search(r"[\w\u4e00-\u9fff·]+\.(?:txt|docx|pdf|jpg|bin|exe|zip)", t)
     if path and re.search(r"校验|比对|完整性", t):
@@ -386,20 +419,28 @@ def decide_act(intent, p):
                           "② 无盐可换大词表（rockyou/CrackStation）；③ 强口令建议放弃爆破。" % (tip_table, algo)}
 
     if intent == "build_table":
-        # 建表：把词表文件逐行正向算 MD5+SHA-256 写入本地对照表（行数即词条数）
-        # v2.3：改走 db.import_wordlist 流式导入（每 1 万条一事务），内存不随词表增长
+        # 建表：把词表文件逐行算 MD5+SHA-256 写入本地对照表（行数即词条数）
+        # v2.3 Step 1：改走 db.import_wordlist 流式导入（每 1 万条一事务），内存不随词表增长
+        # v2.3 Step 2：支持规则档位（rules=min|std|max，默认 std）——一行词表展开成多个变体
         src = p.get("file")
         if not src or not os.path.isfile(src):
             return {"ok": False, "action": "build_table", "result": None,
                     "advice": "需要词表文件（每行一个候选明文）。示例：建表 D:\\wordlist.txt。"
                               "没有词表可用“加密：xxx，用md5算法”逐条攒表。"}
-        res = db.import_wordlist(src, algos=("MD5", "SHA-256"),
-                                 source="wordlist:" + os.path.basename(src))
+        lv = str(p.get("rules") or DEFAULT_RULE_LEVEL).lower()
+        if lv not in RULE_LEVELS:      # 参数白名单：越界档位回落默认，不冒栈打断会话
+            lv = DEFAULT_RULE_LEVEL
+        try:
+            res = db.import_wordlist(src, algos=("MD5", "SHA-256"), rules=lv)
+        except ValueError as exc:      # 档位非法等参数错误：给明确提示
+            return {"ok": False, "action": "build_table", "result": None,
+                    "advice": "导入参数有误：%s（可选档位：%s）" % (exc, "/".join(RULE_LEVELS))}
         return {"ok": True, "action": "build_table",
-                "result": "导入 %d 条，对照表现有 %d 条（MD5+SHA-256 双索引）"
-                          % (res["lines"], res["counts"]["MD5"]),
-                "advice": "已写入 %s。今后 crack 意图会自动查这张表——查表是反查不是解密，"
-                          "命中前提 = 原文在词表里。" % db.db_path()}
+                "result": "导入 %d 行词表 ×%s 档 → %d 个变体，对照表现有 %d 条（MD5+SHA-256 双索引）"
+                          % (res["lines"], lv, res["variants"], res["counts"]["MD5"]),
+                "advice": "规则档位 %s：%s。已写入 %s。今后 crack 意图会自动查这张表——"
+                          "查表是反查不是解密，规则档位只负责“把词表里那一个词展开成常见写法”。"
+                          % (lv, rules.describe(lv), db.db_path())}
 
     if intent == "verify":
         path = p["path"]
@@ -500,7 +541,7 @@ def step(text):
 
 
 BANNER = """══════════════════════════════════════════════════════════════
- 哈希取证迷你智能体 v2.0（感知→决策→行动→反馈 单循环；行动层复用 exp5）
+ 哈希取证迷你智能体 v2.3（感知→决策→行动→反馈 单循环；SQLite 对照表 + 字典规则引擎）
  理解层：--llm 大模型主力（口语自由）+ 正则规则表兜底（断网/无 key 可用）
  红线：① 仅限授权样本 ② 全程审计留痕 ③ 外部API只收脱敏指令、文件内容不出本地
  试试：贴一段哈希 / “加密：062481，sha-256” / “校验 hello.txt” / “对 screening 去重” /
