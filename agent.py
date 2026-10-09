@@ -366,6 +366,20 @@ def decide_act(intent, p):
             if hit:
                 return {"ok": True, "action": "crack", "result": "图形密码 " + "-".join(map(str, hit)),
                         "advice": "空间仅 38.9 万，全量表 1~2 秒穷举完毕——图形密码对取证几乎透明。"}
+        # v2.3 修复：查表落空时先看迁移健康度——旧表迁移失败/被跳过时，
+        # 数据其实还在旧文件里，此时劝用户"去攒表"是误导。
+        ms = db.migration_status()
+        if ms["error"]:
+            reason = ms["error"]
+            return {"ok": False, "action": "crack", "result": None,
+                    "advice": "查表未命中。但注意：**旧对照表迁移未完成（本次未导入任何数据）**，"
+                              "数据库是空表，所以查表必然落空。原因：%s "
+                              "（原始文件未改名，数据未丢失）。请先处理该问题，或重启以自动重试。" % reason}
+        if ms["skipped_count"]:
+            return {"ok": False, "action": "crack", "result": None,
+                    "advice": "查表未命中。注意：旧对照表迁移未完成（跳过 %d 条坏数据），"
+                              "该目标可能在被跳过的条目中。可用 db.migration_status()['skipped'] "
+                              "查看明细并手工处理。" % ms["skipped_count"]}
         tip_table = "" if any(stores) else "本地对照表为空，可先用“加密：xxx，用md5算法”或“建表 <词表.txt>”攒表；"
         return {"ok": False, "action": "crack", "result": None,
                 "advice": "查表未命中。%s%s：① 加盐则查表无效，需现场逐目标计算；"
@@ -533,8 +547,27 @@ DEMO_INPUTS_V12 = [
 ]
 
 
+def migration_notice():
+    """旧对照表迁移异常时的启动提示（横幅下方一行）。正常情况下返回 None。"""
+    try:
+        ms = db.migration_status()
+    except Exception:
+        return None
+    if ms["error"]:
+        return ("⚠ 旧对照表迁移未完成（本次未导入任何数据）：%s\n"
+                "  数据库当前为空表，查表会全部落空。原始文件未改名，数据未丢失；"
+                "修正坏条目后重启即可自动重试。" % ms["error"])
+    if ms["skipped_count"]:
+        return ("⚠ 旧对照表迁移未完成：已跳过 %d 条坏数据（其余已入库）。"
+                "明细见 db.migration_status()['skipped']，原始文件保留作备份。" % ms["skipped_count"])
+    return None
+
+
 def demo():
     print(BANNER)
+    notice = migration_notice()
+    if notice:
+        print("\n" + notice + "\n")
     print("\n【演示模式】基础 %d 句 + v1.1 新增 %d 句 + v1.2 查表闭环 %d 句 + 内存实测\n"
           % (len(DEMO_INPUTS), len(DEMO_INPUTS_V11), len(DEMO_INPUTS_V12)))
     for text in DEMO_INPUTS:

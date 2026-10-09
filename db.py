@@ -26,12 +26,19 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 数据库路径：环境变量 HFA_DB_PATH 优先，默认项目目录下 hash_index.db
+# 数据库路径（import 时的快照，供外部引用）。实际连接路径由 _resolve_path() 每次解析：
+# 显式参数 > 环境变量 HFA_DB_PATH > 默认项目目录下 hash_index.db。
 DB_PATH = os.environ.get("HFA_DB_PATH") or os.path.join(_HERE, "hash_index.db")
+
+# 旧表迁移：坏条目占比阈值。≤ 阈值 → 好数据入库 + 坏条目隔离；> 阈值 → 整批放弃。
+MIGRATE_SKIP_RATIO = 0.05
+# 隔离明细最多保留多少条（防止坏条目极多时 meta 膨胀；总数另记 migrate_skipped_total）
+MIGRATE_SKIP_DETAIL_MAX = 500
 
 # 旧 JSON 表的文件名与默认位置（仅迁移时使用；迁移成功后改名 .migrated.bak）
 JSON_NAME = "hash_table.json"
@@ -110,10 +117,24 @@ def _now():
 
 
 # ---------------------------------------------------------------- 连接 / 建表
+def _resolve_path(path=None):
+    """解析数据库路径：显式参数 > 环境变量 HFA_DB_PATH > 默认项目目录。
+
+    每次调用都重读环境变量，符合"环境变量优先"的直觉——import 之后再设
+    HFA_DB_PATH 也照样生效（旧实现只在 import 时读一次，改 env 无效）。
+    """
+    return os.path.abspath(path or os.environ.get("HFA_DB_PATH")
+                           or os.path.join(_HERE, "hash_index.db"))
+
+
 def connect(path=None):
-    """建立（并缓存）数据库连接：建表 + 设 PRAGMA。重复调用返回同一连接。"""
+    """建立（并缓存）数据库连接：建表 + 设 PRAGMA。重复调用返回同一连接。
+
+    路径每次重新解析：显式参数 > HFA_DB_PATH > 默认。目标路径与缓存连接不一致时
+    自动切换连接（用于测试与运行中切换数据库）。
+    """
     global _CONN, _CONN_PATH
-    target = os.path.abspath(path or DB_PATH)
+    target = _resolve_path(path)
     if _CONN is not None and _CONN_PATH == target:
         return _CONN
     if _CONN is not None:            # 换路径：先关掉旧连接
@@ -134,7 +155,9 @@ def connect(path=None):
     conn.execute("PRAGMA wal_autocheckpoint = 8000")
     conn.executescript(_SCHEMA)
     _CONN, _CONN_PATH = conn, target
-    _auto_migrate(conn)              # 启动时：旧 JSON 存在且表为空 → 自动迁移
+    outcome = _auto_migrate(conn)    # 启动时：旧 JSON 存在且表为空 → 自动迁移
+    if outcome:                      # 有跳过/失败才发声；正常迁移保持静默
+        _warn_migration(outcome)
     return conn
 
 
@@ -153,7 +176,7 @@ def close():
 
 
 def db_path():
-    return _CONN_PATH or os.path.abspath(DB_PATH)
+    return _CONN_PATH or _resolve_path(None)
 
 
 def flush():
@@ -163,13 +186,15 @@ def flush():
 
 
 def _insert_many(rows, sql=_SQL_INSERT):
-    """批量写入：显式事务包裹。返回实际变更的行数。
+    """批量写入：显式事务包裹。返回本次写入的变更行数。
 
-    两个坑都在这一个函数里躲掉：
+    两个实现要点：
     ① 连接是 autocommit（isolation_level=None），不显式开事务的话 executemany 会退化成
        「逐条 INSERT 各自提交」——每条一次 fsync，导入 20 万行要三十秒。
-    ② `cursor.rowcount` 在 executemany 走 array binding 时返回 0，不能拿来校验条数。
-       改用 `conn.total_changes` 前后差值——SQLite 自维护的累计变更行数，可靠。
+    ② 计数用 `conn.total_changes` 前后差值。`rowcount` 在批量插入下同样可靠（实测一致），
+       但对 `INSERT OR REPLACE` 两者都会把"同键替换"计为变更、而表内并未新增行。
+       故本函数返回值只表示"写了多少次"，**不能**当作"表内条数增量"用——
+       需要条数的地方一律回查 `count(algo)`（迁移校验就是这么做的）。
     """
     if not rows:
         return 0
@@ -281,8 +306,63 @@ def import_wordlist(path, algos=DEFAULT_ALGOS, rules=None, source=None):
             "counts": {a: count(a) for a in algos}}
 
 
+def _meta_set(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
+    conn.commit()
+
+
+def _meta_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _meta_del(conn, key):
+    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+    conn.commit()
+
+
+def migration_status(conn=None):
+    """迁移健康状态（供 stats()/agent 的程序化检测使用）。
+
+    返回 {'ok', 'skipped_count', 'error', 'skipped', 'from', 'at'}：
+      ok            —— 无跳过也无失败时为 True
+      skipped_count —— 被隔离的坏条目数
+      error         —— 整批放弃时的原因字符串（无则 None）
+      skipped       —— 坏条目明细列表（algo / digest / plaintext / index / reason）
+    """
+    conn = conn or _conn()
+    skipped_raw = _meta_get(conn, "migrate_skipped")
+    try:
+        skipped = json.loads(skipped_raw) if skipped_raw else []
+    except (ValueError, TypeError):
+        skipped = []
+    error = _meta_get(conn, "migrate_error") or None
+    # 明细可能被 MIGRATE_SKIP_DETAIL_MAX 截断；总数以 migrate_skipped_total 为准
+    total_skipped = _meta_get(conn, "migrate_skipped_total")
+    truncated = _meta_get(conn, "migrate_skipped_truncated") == "1"
+    if total_skipped is not None:
+        try:
+            skipped_count = int(total_skipped)
+        except (TypeError, ValueError):
+            skipped_count = len(skipped)
+    else:
+        skipped_count = len(skipped)
+    return {"ok": not skipped_count and not error,
+            "skipped_count": skipped_count,
+            "error": error,
+            "skipped": skipped,
+            "from": _meta_get(conn, "migrated_from_json") or None,
+            "at": _meta_get(conn, "migrated_at") or None,
+            "detail_truncated": truncated}
+
+
 def stats():
-    """返回 {'MD5': n, 'SHA-256': n, ..., 'rows': 总数, 'size_mb': x, 'path': 数据库路径}。"""
+    """返回各算法条数、磁盘占用，以及**迁移健康状态**。
+
+    关键字段（用于程序化检测，不必靠人盯 stderr）：
+      migrate_error   —— 整批放弃的原因（None 表示无）
+      migrate_skipped —— 被隔离的坏条目条数（0 表示无）
+    """
     conn = _conn()
     out = {a: 0 for a in DEFAULT_ALGOS}
     for algo, n in conn.execute("SELECT algo, COUNT(*) FROM hash_index GROUP BY algo"):
@@ -296,6 +376,11 @@ def stats():
     out["rows"] = total
     out["size_mb"] = round(size / 1048576.0, 3)
     out["path"] = db_path()
+    st = migration_status(conn)
+    out["migrate_error"] = st["error"]
+    out["migrate_skipped"] = st["skipped_count"]
+    out["migrate_skipped_truncated"] = st["detail_truncated"]
+    out["migrate_ok"] = st["ok"]
     return out
 
 
@@ -314,11 +399,54 @@ def _json_candidates():
     return cands
 
 
-def migrate_from_json(json_path, backup_suffix=".migrated.bak"):
-    """迁移旧 JSON 对照表 → hash_index。
+def _scan_json(raw):
+    """把旧表解析成可写入的行 + 坏条目明细。
 
-    成功后原文件改名为 <原名>.migrated.bak；条数校验不通过则整体回滚且不改名。
-    返回迁移的行数（每个算法各算一行）。
+    返回 (rows, expected, bad)：
+      rows     —— 可直接入库的 (algo, blob, plaintext, source, ts) 元组
+      expected —— 各算法合法条目数
+      bad      —— 坏条目明细（algo / digest 原样 / plaintext 原样 / index / reason）
+    坏条目连同原 hex 与原文一起记下来，便于用户从 meta 取回，不丢信息。
+    """
+    ts = _now()
+    rows, expected, bad = [], {}, []
+    for algo, store in raw.items():
+        if not isinstance(store, dict):
+            continue
+        a = normalize_algo(algo)
+        expected.setdefault(a, 0)
+        for idx, (digest_hex, plaintext) in enumerate(store.items()):
+            reason = None
+            blob = _to_blob(digest_hex)
+            if blob is None:
+                reason = "摘要不是合法十六进制"
+            elif not isinstance(plaintext, str):
+                reason = "明文不是字符串"
+            else:
+                try:
+                    _check(a, blob)
+                except ValueError as exc:
+                    reason = str(exc)
+            if reason:
+                bad.append({"algo": a, "digest": str(digest_hex),
+                            "plaintext": plaintext if isinstance(plaintext, str) else repr(plaintext),
+                            "index": idx, "reason": reason})
+                continue
+            rows.append((a, blob, plaintext, "import:json", ts))
+            expected[a] += 1
+    return rows, expected, bad
+
+
+def migrate_from_json(json_path, backup_suffix=".migrated.bak"):
+    """迁移旧 JSON 对照表 → hash_index。返回成功入库的行数。
+
+    分档处理坏条目（MIGRATE_SKIP_RATIO = 5%）：
+      * 无坏条目      → 全部入库，原文件改名 <原名>.migrated.bak（保持原行为）
+      * 坏占比 ≤ 5%   → 好数据入库，坏条目隔离到 meta.migrate_skipped，
+                        **原文件保留原地**——它同时是好数据的来源凭据和坏条目的备份
+      * 坏占比 > 5%   → 整批放弃（一条不写），原文件保留，原因写 meta.migrate_error，
+                        避免"大面积残缺的迁移被误认为成功"
+    无论哪种结果都会写 meta，`stats()` 与 `migration_status()` 均可程序化检测。
     """
     if not json_path or not os.path.isfile(json_path):
         return 0
@@ -327,65 +455,124 @@ def migrate_from_json(json_path, backup_suffix=".migrated.bak"):
     if not isinstance(raw, dict):
         raise ValueError("旧对照表格式异常（顶层应为 dict）：%s" % json_path)
 
-    ts = _now()
-    rows, expected, bad = [], {}, []
-    for algo, store in raw.items():
-        if not isinstance(store, dict):
-            continue
-        a = normalize_algo(algo)
-        expected[a] = 0
-        for digest_hex, plaintext in store.items():
-            blob = _to_blob(digest_hex)
-            if blob is None or not isinstance(plaintext, str):
-                bad.append("%s:%s" % (a, str(digest_hex)[:32]))
-                continue
-            try:
-                _check(a, blob)
-            except ValueError:
-                bad.append("%s:%s" % (a, str(digest_hex)[:32]))
-                continue
-            rows.append((a, blob, plaintext, "import:json", ts))
-            expected[a] += 1
-    if bad:
-        raise ValueError("旧对照表含 %d 条无法解析的条目，为免丢数据已中止迁移：%s"
-                         % (len(bad), "、".join(bad[:5])))
-
+    rows, expected, bad = _scan_json(raw)
+    total = len(rows) + len(bad)
+    ratio = (len(bad) / float(total)) if total else 0.0
     conn = _conn()
-    n = _insert_many(rows, _SQL_UPSERT)   # 显式事务 + total_changes 口径（见 _insert_many）
+    ts = _now()
+
+    # --- 分档 3：坏条目过多 → 整批放弃（不写任何数据行） ---
+    if total and ratio > MIGRATE_SKIP_RATIO:
+        detail = "、".join("%s:%s(%s)" % (b["algo"], b["digest"][:32], b["reason"]) for b in bad[:5])
+        msg = ("旧对照表坏条目占比 %.1f%%（%d/%d）超过阈值 %.0f%%，"
+               "为免残缺迁移被误认为成功，已整批放弃；原文件保留未改名：%s"
+               % (ratio * 100, len(bad), total, MIGRATE_SKIP_RATIO * 100, json_path))
+        _meta_set(conn, "migrate_error", "%s：%s" % (msg, detail))
+        _meta_set(conn, "migrate_skipped", "[]")
+        _meta_del(conn, "migrate_skipped_truncated")
+        _meta_set(conn, "migrate_attempted_at", ts)
+        raise ValueError(msg)
+
+    # --- 分档 1/2：入库合法数据 ---
+    n = _insert_many(rows, _SQL_UPSERT)
     conn.commit()
 
     after = {a: count(a) for a in expected}
-    # 校验口径：JSON 对象的键在同一 algo 内天然唯一，故 expected[a] 就是旧表的唯一条目数。
-    # 迁移要做到"旧条目一条不少地存在于库中" → after[a] >= expected[a]。
-    # 自动迁移时表必为空（before 全 0），此时退化为严格相等：after[a] == expected[a]。
+    # 校验口径：JSON 对象的键在同一 algo 内天然唯一，故 expected[a] 是旧表该算法的合法唯一条目数。
+    # 迁移要做到"合法条目一条不少地进库" → after[a] >= expected[a]。
     mismatch = {a: (expected[a], after[a]) for a in expected if after[a] < expected[a]}
     if mismatch:
-        raise RuntimeError("迁移条数校验失败（算法: 旧表唯一条目/库中条数）：%s" % mismatch)
+        msg = "迁移条数校验失败（算法: 旧表合法条目/库中条数）：%s" % mismatch
+        _meta_set(conn, "migrate_error", msg)
+        raise RuntimeError(msg)
 
-    os.replace(json_path, json_path + backup_suffix)     # 校验通过 → 原文件改名备份
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                 ("migrated_from_json", os.path.abspath(json_path)))
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("migrated_at", ts))
+    _meta_del(conn, "migrate_error")
+    _meta_set(conn, "migrated_from_json", os.path.abspath(json_path))
+    _meta_set(conn, "migrated_at", ts)
+    _meta_set(conn, "migrate_attempted_at", ts)
+
+    if bad:                                   # 分档 2：隔离坏条目，原文件保留
+        payload = bad[:MIGRATE_SKIP_DETAIL_MAX]
+        _meta_set(conn, "migrate_skipped", json.dumps(payload, ensure_ascii=False))
+        _meta_set(conn, "migrate_skipped_truncated",
+                  "1" if len(bad) > MIGRATE_SKIP_DETAIL_MAX else "0")
+        _meta_set(conn, "migrate_skipped_total", str(len(bad)))
+    else:                                     # 分档 1：干净迁移 → 原文件改名备份
+        _meta_del(conn, "migrate_skipped")
+        _meta_del(conn, "migrate_skipped_truncated")
+        _meta_del(conn, "migrate_skipped_total")
+        os.replace(json_path, json_path + backup_suffix)
     conn.commit()
     return n
 
 
+def _warn_migration(outcome):
+    """迁移有跳过/失败时，向 stderr 发醒目提示（含取回办法）。"""
+    path = outcome.get("from") or outcome.get("path") or "?"
+    line = "!" * 70
+    out = [line]
+    if outcome.get("error"):
+        out.append("!! [HashForensics] 旧对照表迁移失败，本次未导入任何数据")
+        out.append("!! 原因：%s" % outcome["error"])
+        out.append("!! 数据库当前为空表，查表将全部落空。原始文件完好保留：%s" % path)
+        out.append("!! 处理：修正上述坏条目后重启即可自动重试；或用 db.migrate_from_json() 手工迁移。")
+    else:
+        out.append("!! [HashForensics] 旧对照表迁移完成，但有条目被跳过")
+        out.append("!! 旧表共 %d 条：成功 %d 条，跳过 %d 条（坏数据未丢弃）"
+                   % (outcome.get("total", 0), outcome.get("migrated", 0),
+                      outcome.get("skipped_count", 0)))
+        out.append("!! 原始文件保留未改名：%s" % path)
+        out.append("!! 跳过的条目已存入 meta.migrate_skipped（含 algo/原摘要/原文/原因），")
+        out.append("!! 可取回：python -c \"import db,json; print(json.dumps(db.migration_status()['skipped'],"
+                   " ensure_ascii=False, indent=1))\"")
+    out.append(line)
+    sys.stderr.write("\n".join(out) + "\n")
+    sys.stderr.flush()
+
+
 def _auto_migrate(conn):
-    """启动时自动迁移：hash_index 为空且存在旧 hash_table.json → 迁移并备份。"""
+    """启动时自动迁移：hash_index 为空且存在旧 hash_table.json → 迁移。
+
+    返回结果摘要 dict（无迁移发生则返回 None）；异常不抛出——已写入 meta.migrate_error
+    供 stats() 检测，并保留原文件等待用户修正后重启重试。
+    """
     if conn.execute("SELECT 1 FROM hash_index LIMIT 1").fetchone():
-        return 0
-    if conn.execute("SELECT 1 FROM meta WHERE key = 'migrated_from_json'").fetchone():
-        return 0
+        return _existing_issue(conn)
+    if _meta_get(conn, "migrated_from_json"):
+        return _existing_issue(conn)
     for cand in _json_candidates():
-        if os.path.isfile(cand):
-            try:
-                return migrate_from_json(cand)
-            except Exception as exc:      # 迁移失败不能拖垮启动：保留原文件，改用空表继续
-                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                             ("migrate_error", "%s: %s" % (cand, exc)))
-                conn.commit()
-                return 0
-    return 0
+        if not os.path.isfile(cand):
+            continue
+        try:
+            n = migrate_from_json(cand)
+        except Exception as exc:      # 迁移失败不拖垮启动；保留原文件，改用空表继续
+            msg = "%s: %s" % (cand, exc)
+            if not _meta_get(conn, "migrate_error"):   # migrate_from_json 已写过就不覆盖
+                _meta_set(conn, "migrate_error", msg)
+            return {"from": cand, "path": cand, "migrated": count(None), "total": 0,
+                    "skipped_count": 0, "error": msg}
+        st = migration_status(conn)
+        if st["skipped_count"] or st["error"]:
+            with open(cand, encoding="utf-8") as f:
+                try:
+                    total = sum(len(v) for v in json.load(f).values() if isinstance(v, dict))
+                except Exception:
+                    total = 0
+            return {"from": st["from"] or cand, "path": cand, "migrated": n, "total": total,
+                    "skipped_count": st["skipped_count"], "error": st["error"]}
+        return None
+    return None
+
+
+def _existing_issue(conn):
+    """库里已有数据时，仍把历史遗留的迁移异常带回给 connect()，保证每次启动都可见。"""
+    st = migration_status(conn)
+    if st["skipped_count"] or st["error"]:
+        rows = count(None)
+        return {"from": st["from"], "path": st["from"], "migrated": rows,
+                "total": rows + st["skipped_count"],
+                "skipped_count": st["skipped_count"], "error": st["error"]}
+    return None
 
 
 # ---------------------------------------------------------------- 旧 dict 语义视图
